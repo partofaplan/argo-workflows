@@ -1,0 +1,25 @@
+# Runs the sftp-file-transfer template every 5 minutes.
+apiVersion: argoproj.io/v1alpha1
+kind: CronWorkflow
+metadata:
+  name: sftp-file-transfer
+  namespace: argo
+spec:
+  schedules:
+    - "*/5 * * * *"
+  timezone: America/Chicago
+  concurrencyPolicy: Forbid       # never start a run while the last one is still going
+  startingDeadlineSeconds: 120    # if the controller was down, catch up only if <2m late
+  successfulJobsHistoryLimit: 10
+  failedJobsHistoryLimit: 5
+  workflowMetadata:
+    labels:
+      app: file-transfer-demo
+  workflowSpec:
+    workflowTemplateRef:
+      name: sftp-file-transfer
+    # Override any template parameter per schedule, e.g.:
+    # arguments:
+    #   parameters:
+    #     - name: file-pattern
+    #       value: "orders-*.csv"

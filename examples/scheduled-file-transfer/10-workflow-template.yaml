@@ -1,0 +1,263 @@
+# Reusable "move files from server A to server B" pipeline.
+#
+#   discover ──► transfer (one pod per file, fanned out) ──► summarize
+#       │
+#       └──► nothing-to-do (when the source is empty)
+#
+#   onExit: report   (always runs; where you'd page someone / post to Slack)
+#
+# Each transfer: download → checksum → upload as a temp name → atomic rename →
+# download again and verify checksum → archive the original on the source.
+# A failed step is retried with exponential backoff, and a file is only
+# archived on the source after the destination copy is verified.
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: sftp-file-transfer
+  namespace: argo
+spec:
+  serviceAccountName: argo-workflow
+  entrypoint: move-files
+  onExit: report
+  activeDeadlineSeconds: 1800
+  arguments:
+    parameters:
+      - name: source-host
+        value: sftp-source.file-servers.svc.cluster.local
+      - name: source-dir
+        value: data/outbound
+      - name: archive-dir
+        value: data/archive
+      - name: destination-host
+        value: sftp-destination.file-servers.svc.cluster.local
+      - name: destination-dir
+        value: data/inbound
+      - name: sftp-user
+        value: demo
+      - name: file-pattern
+        description: Shell glob of file names to move
+        value: "*.csv"
+      - name: max-files
+        description: Most files to move in one run; the rest wait for the next run
+        value: "20"
+      - name: chaos-percent
+        description: Percent chance each transfer attempt fails on purpose, to show retries
+        value: "0"
+
+  # SSH private key + known_hosts, created by setup.sh
+  volumes:
+    - name: sftp-credentials
+      secret:
+        secretName: sftp-client-credentials
+        defaultMode: 0400
+
+  templates:
+    - name: move-files
+      parallelism: 4  # at most 4 transfer pods at once
+      dag:
+        tasks:
+          - name: discover
+            template: list-source-files
+
+          - name: nothing-to-do
+            depends: discover
+            when: "{{tasks.discover.outputs.parameters.count}} == 0"
+            template: log
+            arguments:
+              parameters:
+                - name: message
+                  value: "No files matching {{workflow.parameters.file-pattern}} on {{workflow.parameters.source-host}}"
+
+          - name: transfer
+            depends: discover
+            when: "{{tasks.discover.outputs.parameters.count}} > 0"
+            template: transfer-file
+            withParam: "{{tasks.discover.outputs.parameters.files}}"
+            arguments:
+              parameters:
+                - name: file
+                  value: "{{item}}"
+
+          - name: summarize
+            depends: transfer
+            when: "{{tasks.discover.outputs.parameters.count}} > 0"
+            template: summarize
+            arguments:
+              parameters:
+                - name: results
+                  value: "{{tasks.transfer.outputs.parameters}}"
+
+    # --- Step 1: find files waiting on the source server ----------------------
+    - name: list-source-files
+      outputs:
+        parameters:
+          - name: files
+            valueFrom: {path: /tmp/files.json}
+          - name: count
+            valueFrom: {path: /tmp/count}
+      retryStrategy:
+        limit: "3"
+        retryPolicy: Always
+        backoff: {duration: "10s", factor: "2"}
+      script:
+        image: atmoz/sftp:debian
+        command: [bash]
+        env:
+          - {name: SFTP_USER, value: "{{workflow.parameters.sftp-user}}"}
+          - {name: SOURCE_HOST, value: "{{workflow.parameters.source-host}}"}
+          - {name: SOURCE_DIR, value: "{{workflow.parameters.source-dir}}"}
+          - {name: PATTERN, value: "{{workflow.parameters.file-pattern}}"}
+          - {name: MAX_FILES, value: "{{workflow.parameters.max-files}}"}
+        volumeMounts: &sftp-mounts
+          - {name: sftp-credentials, mountPath: /credentials, readOnly: true}
+        resources: &small
+          requests: {cpu: 10m, memory: 32Mi}
+        source: |
+          set -euo pipefail
+          sftp_batch() {  # usage: sftp_batch HOST <<< "commands"
+            sftp -q -b - -i /credentials/id_ed25519 \
+              -o BatchMode=yes -o UserKnownHostsFile=/credentials/known_hosts \
+              -o ConnectTimeout=10 "$SFTP_USER@$1"
+          }
+
+          echo "Listing $SOURCE_HOST:$SOURCE_DIR"
+          listing=$(sftp_batch "$SOURCE_HOST" <<< "ls -1 $SOURCE_DIR")
+          mapfile -t names < <(grep -v '^sftp>' <<< "$listing" | xargs -rn1 basename | sort)
+
+          selected=()
+          for n in "${names[@]}"; do
+            if (( ${#selected[@]} >= MAX_FILES )); then break; fi
+            if [[ $n == $PATTERN ]]; then selected+=("$n"); fi
+          done
+
+          json="["
+          for n in "${selected[@]}"; do json+="\"$n\","; done
+          json="${json%,}]"
+          echo "$json" > /tmp/files.json
+          echo "${#selected[@]}" > /tmp/count
+          echo "Found ${#names[@]} file(s); ${#selected[@]} match $PATTERN and will move this run"
+          if (( ${#selected[@]} )); then printf '  %s\n' "${selected[@]}"; fi
+
+    # --- Step 2: move one file, verified end to end ---------------------------
+    - name: transfer-file
+      inputs:
+        parameters:
+          - name: file
+      outputs:
+        parameters:
+          - name: result
+            valueFrom: {path: /tmp/result.json}
+      retryStrategy:
+        limit: "4"
+        retryPolicy: Always
+        backoff: {duration: "5s", factor: "2", maxDuration: "5m"}
+      activeDeadlineSeconds: 300
+      script:
+        image: atmoz/sftp:debian
+        command: [bash]
+        env:
+          - {name: FILE, value: "{{inputs.parameters.file}}"}
+          - {name: SFTP_USER, value: "{{workflow.parameters.sftp-user}}"}
+          - {name: SOURCE_HOST, value: "{{workflow.parameters.source-host}}"}
+          - {name: SOURCE_DIR, value: "{{workflow.parameters.source-dir}}"}
+          - {name: ARCHIVE_DIR, value: "{{workflow.parameters.archive-dir}}"}
+          - {name: DEST_HOST, value: "{{workflow.parameters.destination-host}}"}
+          - {name: DEST_DIR, value: "{{workflow.parameters.destination-dir}}"}
+          - {name: CHAOS_PERCENT, value: "{{workflow.parameters.chaos-percent}}"}
+        volumeMounts: *sftp-mounts
+        resources: *small
+        source: |
+          set -euo pipefail
+          sftp_batch() {
+            sftp -q -b - -i /credentials/id_ed25519 \
+              -o BatchMode=yes -o UserKnownHostsFile=/credentials/known_hosts \
+              -o ConnectTimeout=10 "$SFTP_USER@$1"
+          }
+          work=$(mktemp -d)
+
+          if (( RANDOM % 100 < CHAOS_PERCENT )); then
+            echo "Simulated network failure (chaos-percent=$CHAOS_PERCENT); Argo will retry"
+            exit 1
+          fi
+
+          echo "1/5 Downloading $SOURCE_HOST:$SOURCE_DIR/$FILE"
+          sftp_batch "$SOURCE_HOST" <<< "get $SOURCE_DIR/$FILE $work/$FILE"
+          sha=$(sha256sum "$work/$FILE" | cut -d' ' -f1)
+          bytes=$(stat -c %s "$work/$FILE")
+          echo "    $bytes bytes, sha256 $sha"
+
+          echo "2/5 Uploading to $DEST_HOST:$DEST_DIR/.$FILE.part"
+          echo "3/5 Renaming to $DEST_DIR/$FILE (consumers never see a partial file)"
+          sftp_batch "$DEST_HOST" <<EOF
+          put $work/$FILE $DEST_DIR/.$FILE.part
+          rename $DEST_DIR/.$FILE.part $DEST_DIR/$FILE
+          EOF
+
+          echo "4/5 Verifying the destination copy"
+          sftp_batch "$DEST_HOST" <<< "get $DEST_DIR/$FILE $work/verify"
+          dest_sha=$(sha256sum "$work/verify" | cut -d' ' -f1)
+          if [[ $dest_sha != "$sha" ]]; then
+            echo "Checksum mismatch: source $sha, destination $dest_sha" >&2
+            exit 1
+          fi
+
+          archived="$(date -u +%Y%m%dT%H%M%SZ)-$FILE"
+          echo "5/5 Archiving source file to $ARCHIVE_DIR/$archived"
+          sftp_batch "$SOURCE_HOST" <<< "rename $SOURCE_DIR/$FILE $ARCHIVE_DIR/$archived"
+
+          printf '{"file":"%s","bytes":%s,"sha256":"%s"}\n' "$FILE" "$bytes" "$sha" | tee /tmp/result.json
+
+    # --- Step 3: roll up what the fan-out did --------------------------------
+    - name: summarize
+      inputs:
+        parameters:
+          - name: results
+      script:
+        image: python:3.12-alpine
+        command: [python]
+        resources: *small
+        source: |
+          import json
+          rows = [json.loads(r["result"]) for r in json.loads(r'''{{inputs.parameters.results}}''')]
+          total = sum(r["bytes"] for r in rows)
+          print(f"Moved {len(rows)} file(s), {total:,} bytes total\n")
+          for r in rows:
+              print(f"  {r['file']:<40} {r['bytes']:>8,} B  sha256:{r['sha256'][:12]}")
+
+    - name: log
+      inputs:
+        parameters:
+          - name: message
+      container:
+        image: busybox:1.36
+        command: [echo, "{{inputs.parameters.message}}"]
+        resources: *small
+
+    # --- Exit handler: runs whether the workflow passed or failed ------------
+    - name: report
+      script:
+        image: python:3.12-alpine
+        command: [python]
+        env:  # passed as env vars so JSON quoting can't break the script
+          - {name: STATUS, value: "{{workflow.status}}"}
+          - {name: FAILURES, value: "{{workflow.failures}}"}
+        resources: *small
+        source: |
+          import json, os, sys
+          status = os.environ["STATUS"]
+          print(f"Workflow {{workflow.name}} finished: {status} in {float('{{workflow.duration}}'):.0f}s")
+
+          raw = os.environ.get("FAILURES") or "null"
+          failures = json.loads(raw)
+          if isinstance(failures, str):
+              failures = json.loads(failures)
+          failures = [f for f in failures or [] if f.get("message")]  # skip group nodes
+          if failures:
+              print(f"\n{len(failures)} failure(s):")
+              for f in sorted(failures, key=lambda f: f["finishedAt"]):
+                  print(f"  {f['finishedAt']}  {f['displayName']}: {f['message']}")
+
+          if status != "Succeeded":
+              print("\nFiles that did not transfer are still on the source and will be retried next run.")
+              print("(A real pipeline would page on-call or post to Slack here.)")
+              sys.exit(1)
