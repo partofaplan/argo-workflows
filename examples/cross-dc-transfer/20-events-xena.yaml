@@ -1,0 +1,121 @@
+# The trigger: hercules' watcher calls a webhook in xena, and a Sensor turns
+# each call into a run of the cross-dc-transfer WorkflowTemplate.
+#
+#   hercules watcher ──HTTP POST──► Traefik (host.k3d.internal:9080, Host: events.xena.internal)
+#                                     └► EventSource "landing-zone" (/files-landed, bearer token)
+#                                          └► EventBus (NATS JetStream)
+#                                               └► Sensor "cross-dc-transfer" ──► Workflow
+#
+# Needs the Argo Events controller (Helm chart argo/argo-events).
+apiVersion: argoproj.io/v1alpha1
+kind: EventBus
+metadata:
+  name: default
+  namespace: argo
+spec:
+  jetstream:
+    version: 2.10.29  # must be one of the versions in the controller's config
+---
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: landing-zone
+  namespace: argo
+spec:
+  service:
+    ports:
+      - {port: 12000, targetPort: 12000}
+  webhook:
+    files-landed:
+      port: "12000"
+      endpoint: /files-landed
+      method: POST
+      # Callers must send "Authorization: Bearer <token>", since the route is
+      # reachable on the host's port 9080.
+      authSecret:
+        name: landing-zone-webhook
+        key: token
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: landing-zone-webhook
+  namespace: argo
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: events.xena.internal
+      http:
+        paths:
+          - path: /files-landed
+            pathType: Exact
+            backend:
+              service:
+                name: landing-zone-eventsource-svc
+                port: {number: 12000}
+---
+# The Sensor may only create Workflows in this namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cross-dc-transfer-sensor
+  namespace: argo
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cross-dc-transfer-sensor
+  namespace: argo
+rules:
+  - apiGroups: [argoproj.io]
+    resources: [workflows]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cross-dc-transfer-sensor
+  namespace: argo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cross-dc-transfer-sensor
+subjects:
+  - kind: ServiceAccount
+    name: cross-dc-transfer-sensor
+    namespace: argo
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: cross-dc-transfer
+  namespace: argo
+spec:
+  template:
+    serviceAccountName: cross-dc-transfer-sensor
+  dependencies:
+    - name: files-landed
+      eventSourceName: landing-zone
+      eventName: files-landed
+  triggers:
+    - template:
+        name: start-transfer
+        k8s:
+          operation: create
+          source:
+            resource:
+              apiVersion: argoproj.io/v1alpha1
+              kind: Workflow
+              metadata:
+                generateName: cross-dc-transfer-
+                namespace: argo
+                labels: {app: cross-dc-transfer}
+              spec:
+                workflowTemplateRef: {name: cross-dc-transfer}
+                arguments:
+                  parameters:
+                    - {name: files-reported, value: "0"}
+          parameters:
+            # copy the watcher's file count into the run, for display
+            - src: {dependencyName: files-landed, dataKey: body.files}
+              dest: spec.arguments.parameters.0.value

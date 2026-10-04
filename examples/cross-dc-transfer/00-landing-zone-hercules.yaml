@@ -1,0 +1,97 @@
+# Source landing zone, in the "hercules" data center (kube context k3d-hercules).
+#
+#   /data/outbound   files are dropped here (./drop-files.sh)
+#   /data/sent       files move here after xena has verified its decrypted copy
+#
+# Two containers share the volume:
+#   sshd     key-only SSH, so xena's workflow can encrypt files here and stream
+#            out only the ciphertext. Plaintext never leaves hercules.
+#   watcher  notices new files and calls xena's webhook (see image/lz-watch.sh)
+#
+# Reachable from xena at host.k3d.internal:2322, which k3d maps to NodePort 30022.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: landing-zone
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: landing-zone-data
+  namespace: landing-zone
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: {storage: 1Gi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: landing-zone
+  namespace: landing-zone
+  labels: {app: landing-zone}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}  # the volume can only be mounted on one node
+  selector:
+    matchLabels: {app: landing-zone}
+  template:
+    metadata:
+      labels: {app: landing-zone}
+    spec:
+      containers:
+        - name: sshd
+          image: dc-transfer/tools:1.0
+          imagePullPolicy: IfNotPresent
+          command: [lz-sshd.sh]
+          env:
+            - {name: LZ_DIRS, value: "outbound sent"}
+          ports:
+            - containerPort: 22
+          readinessProbe:
+            tcpSocket: {port: 22}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: host-key, mountPath: /keys/host, readOnly: true}
+            - {name: client-pubkey, mountPath: /keys/client, readOnly: true}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+        - name: watcher
+          image: dc-transfer/tools:1.0
+          imagePullPolicy: IfNotPresent
+          command: [lz-watch.sh]
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+          env:
+            - {name: WATCH_DIR, value: /data/outbound}
+            - {name: QUIET_SECONDS, value: "10"}
+            # xena's Traefik ingress, reached through the host; the Host header
+            # selects the webhook route (see 20-events-xena.yaml)
+            - {name: WEBHOOK_URL, value: "http://host.k3d.internal:9080/files-landed"}
+            - {name: WEBHOOK_HOST, value: events.xena.internal}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: webhook-token, mountPath: /webhook, readOnly: true}
+          resources:
+            requests: {cpu: 5m, memory: 8Mi}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: landing-zone-data}
+        - name: host-key
+          secret: {secretName: landing-zone-host-key, defaultMode: 0400}
+        - name: client-pubkey
+          secret: {secretName: landing-zone-authorized-key}
+        - name: webhook-token
+          secret: {secretName: landing-zone-webhook}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: landing-zone
+  namespace: landing-zone
+spec:
+  type: NodePort
+  selector: {app: landing-zone}
+  ports:
+    - {name: ssh, port: 22, targetPort: 22, nodePort: 30022}

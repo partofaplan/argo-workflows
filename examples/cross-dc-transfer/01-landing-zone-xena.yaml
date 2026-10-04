@@ -1,0 +1,71 @@
+# Destination landing zone, in the "xena" data center (kube context k3d-xena).
+#
+#   /data/encrypted  ciphertext (.age) exactly as it arrived from hercules
+#   /data/inbound    decrypted files, checksum-verified against the original
+#
+# Key-only SSH, reachable only inside xena at
+# landing-zone.landing-zone.svc.cluster.local.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: landing-zone
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: landing-zone-data
+  namespace: landing-zone
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: {storage: 1Gi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: landing-zone
+  namespace: landing-zone
+  labels: {app: landing-zone}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: landing-zone}
+  template:
+    metadata:
+      labels: {app: landing-zone}
+    spec:
+      containers:
+        - name: sshd
+          image: dc-transfer/tools:1.0
+          imagePullPolicy: IfNotPresent
+          command: [lz-sshd.sh]
+          env:
+            - {name: LZ_DIRS, value: "encrypted inbound"}
+          ports:
+            - containerPort: 22
+          readinessProbe:
+            tcpSocket: {port: 22}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: host-key, mountPath: /keys/host, readOnly: true}
+            - {name: client-pubkey, mountPath: /keys/client, readOnly: true}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: landing-zone-data}
+        - name: host-key
+          secret: {secretName: landing-zone-host-key, defaultMode: 0400}
+        - name: client-pubkey
+          secret: {secretName: landing-zone-authorized-key}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: landing-zone
+  namespace: landing-zone
+spec:
+  selector: {app: landing-zone}
+  ports:
+    - {name: ssh, port: 22, targetPort: 22}
