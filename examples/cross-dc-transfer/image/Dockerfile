@@ -12,4 +12,4 @@ RUN apk add --no-cache bash coreutils openssh-server openssh-client age jq curl 
  && sed -i 's/^lz:!:/lz:*:/' /etc/shadow
 
 COPY sshd_config /etc/ssh/sshd_config
-COPY lz-sshd.sh lz-watch.sh /usr/local/bin/
+COPY lz-sshd.sh lz-watch.sh lz-archive.sh /usr/local/bin/

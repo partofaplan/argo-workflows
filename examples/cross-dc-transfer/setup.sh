@@ -7,7 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 SOURCE_CONTEXT=${SOURCE_CONTEXT:-k3d-hercules}
 DEST_CONTEXT=${DEST_CONTEXT:-k3d-xena}
-IMAGE=dc-transfer/tools:1.0
+IMAGE=dc-transfer/tools:1.1
 KEYS=.keys
 src() { kubectl --context "$SOURCE_CONTEXT" "$@"; }
 dst() { kubectl --context "$DEST_CONTEXT" "$@"; }

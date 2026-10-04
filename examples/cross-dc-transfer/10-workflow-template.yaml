@@ -1,16 +1,30 @@
 # Moves files from hercules' landing zone to xena's, encrypted in transit.
 #
-#   discover ──► for each file (fanned out, 6 at a time):
+#   discover ──► for each chunk of up to 10 files (fanned out, 6 chunks at a time):
 #       │          encrypt-and-send ──► decrypt-and-verify
 #       │                                        └──► summarize
 #       └──► nothing-to-do (when the source is empty)
 #
-# encrypt-and-send    hercules encrypts the file with xena's age public key, and
+# encrypt-and-send    hercules encrypts each file with xena's age public key, and
 #                     only the ciphertext crosses to xena's landing zone
 #                     (encrypted/NAME.txt.age). The plaintext never leaves hercules.
 # decrypt-and-verify  decrypts with xena's private key (a Secret that exists only
 #                     in xena), checks the SHA-256 against the original, writes
 #                     inbound/NAME.txt, then moves the original to sent/ on hercules.
+#
+# Files are grouped into chunks so 50 files need 10 pods instead of 100. A
+# failure retries the whole chunk. Every step is safe to repeat, and a file is
+# archived on hercules only after its decrypted copy is verified, so files from
+# a chunk that never succeeds stay in outbound/ for the next run.
+#
+# Repeated names (checked against xena:inbound/ before encrypting, and again
+# right before writing):
+#   same name, same content       duplicate: not resent; original -> sent/
+#   same name, different content  conflict: not sent, inbound/ untouched;
+#                                 original -> hercules conflicts/ + NAME.reason
+# Originals are archived by image/lz-archive.sh, which moves a file only if its
+# SHA-256 still matches what was sent. A file re-dropped under the same name
+# mid-run stays in outbound/ for the next run.
 #
 # Started by the Sensor in 20-events-xena.yaml when files land on hercules.
 # The mutex makes overlapping triggers queue up instead of fighting over files.
@@ -42,6 +56,9 @@ spec:
       - name: max-files
         description: Most files to move in one run; the rest wait for the next run
         value: "100"
+      - name: chunk-size
+        description: Files handled by each pair of encrypt/decrypt pods
+        value: "10"
 
   volumes:
     # SSH client key, known_hosts for both landing zones, xena's age public key
@@ -71,11 +88,11 @@ spec:
           - name: move
             depends: discover
             when: "{{tasks.discover.outputs.parameters.count}} > 0"
-            template: move-one-file
-            withParam: "{{tasks.discover.outputs.parameters.files}}"
+            template: move-chunk
+            withParam: "{{tasks.discover.outputs.parameters.chunks}}"
             arguments:
               parameters:
-                - name: file
+                - name: files
                   value: "{{item}}"
 
           - name: summarize
@@ -87,11 +104,11 @@ spec:
                 - name: results
                   value: "{{tasks.move.outputs.parameters}}"
 
-    # --- One file: encrypt on hercules, then decrypt in xena ------------------
-    - name: move-one-file
+    # --- One chunk: encrypt on hercules, then decrypt in xena -----------------
+    - name: move-chunk
       inputs:
         parameters:
-          - name: file
+          - name: files  # JSON array of file names
       outputs:
         parameters:
           - name: result
@@ -102,23 +119,20 @@ spec:
             template: encrypt-and-send
             arguments:
               parameters:
-                - {name: file, value: "{{inputs.parameters.file}}"}
+                - {name: files, value: "{{inputs.parameters.files}}"}
           - name: decrypt-and-verify
             depends: encrypt-and-send
             template: decrypt-and-verify
             arguments:
               parameters:
-                - {name: file, value: "{{inputs.parameters.file}}"}
-                - {name: sha256, value: "{{tasks.encrypt-and-send.outputs.parameters.sha256}}"}
-                - {name: bytes, value: "{{tasks.encrypt-and-send.outputs.parameters.bytes}}"}
-                - {name: encrypted-bytes, value: "{{tasks.encrypt-and-send.outputs.parameters.encrypted-bytes}}"}
+                - {name: sent, value: "{{tasks.encrypt-and-send.outputs.parameters.sent}}"}
 
-    # --- Step 1: list what's waiting on hercules -----------------------------
+    # --- Step 1: list what's waiting on hercules, split into chunks ----------
     - name: list-source-files
       outputs:
         parameters:
-          - name: files
-            valueFrom: {path: /tmp/files.json}
+          - name: chunks
+            valueFrom: {path: /tmp/chunks.json}
           - name: count
             valueFrom: {path: /tmp/count}
       retryStrategy: &retry
@@ -126,14 +140,14 @@ spec:
         retryPolicy: Always
         backoff: {duration: "5s", factor: "2", maxDuration: "5m"}
       script:
-        image: dc-transfer/tools:1.0
+        image: dc-transfer/tools:1.1
         imagePullPolicy: IfNotPresent
         command: [bash]
-        env: &ssh-env
+        env:
           - {name: SRC_HOST, value: "{{workflow.parameters.source-host}}"}
           - {name: SRC_PORT, value: "{{workflow.parameters.source-port}}"}
-          - {name: DST_HOST, value: "{{workflow.parameters.destination-host}}"}
           - {name: MAX_FILES, value: "{{workflow.parameters.max-files}}"}
+          - {name: CHUNK_SIZE, value: "{{workflow.parameters.chunk-size}}"}
         volumeMounts:
           - {name: transfer-credentials, mountPath: /credentials, readOnly: true}
         resources: &small
@@ -146,28 +160,28 @@ spec:
           echo "Listing hercules:/data/outbound"
           # Only plain names, so file names are safe to use in remote commands
           src 'ls -1 outbound' | grep -E '^[A-Za-z0-9._-]+\.txt$' | sort | head -n "$MAX_FILES" > /tmp/names || true
-          jq -R . /tmp/names | jq -sc . > /tmp/files.json
+          jq -R . /tmp/names | jq -sc --argjson n "$CHUNK_SIZE" '[range(0; length; $n) as $i | .[$i:$i+$n]]' > /tmp/chunks.json
           wc -l < /tmp/names | tr -d ' ' > /tmp/count
-          echo "$(cat /tmp/count) file(s) to move this run"
+          echo "$(cat /tmp/count) file(s) to move this run, in $(jq length /tmp/chunks.json) chunk(s) of up to $CHUNK_SIZE"
 
     # --- Step 2a: encrypt on hercules, ship only ciphertext ------------------
     - name: encrypt-and-send
       inputs:
         parameters:
-          - name: file
+          - name: files
       outputs:
         parameters:
-          - {name: sha256, valueFrom: {path: /tmp/sha256}}
-          - {name: bytes, valueFrom: {path: /tmp/bytes}}
-          - {name: encrypted-bytes, valueFrom: {path: /tmp/encrypted-bytes}}
+          # JSON array: [{file, sha256, bytes, encrypted_bytes, status}, ...]
+          # status: sent | duplicate | conflict
+          - {name: sent, valueFrom: {path: /tmp/sent.json}}
       retryStrategy: *retry
-      activeDeadlineSeconds: 300
+      activeDeadlineSeconds: 600
       script:
-        image: dc-transfer/tools:1.0
+        image: dc-transfer/tools:1.1
         imagePullPolicy: IfNotPresent
         command: [bash]
         env:
-          - {name: FILE, value: "{{inputs.parameters.file}}"}
+          - {name: FILES, value: "{{inputs.parameters.files}}"}
           - {name: SRC_HOST, value: "{{workflow.parameters.source-host}}"}
           - {name: SRC_PORT, value: "{{workflow.parameters.source-port}}"}
           - {name: DST_HOST, value: "{{workflow.parameters.destination-host}}"}
@@ -176,50 +190,71 @@ spec:
         resources: *small
         source: |
           set -euo pipefail
-          opts=(-i /credentials/id_ed25519 -o BatchMode=yes -o ConnectTimeout=10 -o UserKnownHostsFile=/credentials/known_hosts)
+          # One SSH connection per host, reused for every command in this chunk
+          opts=(-i /credentials/id_ed25519 -o BatchMode=yes -o ConnectTimeout=10
+                -o UserKnownHostsFile=/credentials/known_hosts
+                -o ControlMaster=auto -o ControlPath=/tmp/ssh-%h-%p -o ControlPersist=120)
           src() { ssh "${opts[@]}" -p "$SRC_PORT" "lz@$SRC_HOST" "$@"; }
           dst() { ssh "${opts[@]}" "lz@$DST_HOST" "$@"; }
           recipient=$(cat /credentials/age-recipient)
+          mapfile -t files < <(jq -r '.[]' <<< "$FILES")
+          echo "Encrypting ${#files[@]} file(s) on hercules for xena's key ($recipient)"
+          echo "and streaming only ciphertext to xena:encrypted/"
 
-          echo "1/3 Fingerprinting hercules:outbound/$FILE"
-          read -r sha bytes < <(src "sha256sum outbound/$FILE | cut -d' ' -f1; stat -c %s outbound/$FILE" | paste -sd' ')
-          echo "    $bytes bytes, sha256 $sha"
+          record() {  # record FILE SHA BYTES ENC_BYTES STATUS
+            jq -nc --arg f "$1" --arg s "$2" --argjson b "$3" --argjson e "$4" --arg st "$5" \
+              '{file: $f, sha256: $s, bytes: $b, encrypted_bytes: $e, status: $st}' >> /tmp/sent.jsonl
+          }
 
-          echo "2/3 Encrypting on hercules for xena's key ($recipient)"
-          echo "    and streaming the ciphertext to xena:encrypted/$FILE.age"
-          src "age -r $recipient outbound/$FILE" \
-            | dst "cat > encrypted/.$FILE.age.part && mv encrypted/.$FILE.age.part encrypted/$FILE.age"
+          : > /tmp/sent.jsonl
+          for f in "${files[@]}"; do
+            [[ $f =~ ^[A-Za-z0-9._-]+\.txt$ ]] || { echo "Refusing unsafe name: $f" >&2; exit 1; }
 
-          echo "3/3 Checking what landed in xena is ciphertext"
-          enc_bytes=$(dst "stat -c %s encrypted/$FILE.age")
-          header=$(dst "head -n1 encrypted/$FILE.age")
-          [[ $header == "age-encryption.org/v1" ]] || { echo "Not an age file: $header" >&2; exit 1; }
-          echo "    $enc_bytes bytes, header \"$header\""
+            read -r sha bytes < <(src "sha256sum outbound/$f | cut -d' ' -f1; stat -c %s outbound/$f" | paste -sd' ')
 
-          echo "$sha" > /tmp/sha256; echo "$bytes" > /tmp/bytes; echo "$enc_bytes" > /tmp/encrypted-bytes
+            # Has xena already received a file with this name?
+            existing=$(dst "if [ -f inbound/$f ]; then sha256sum inbound/$f | cut -d' ' -f1; fi")
+            if [[ $existing == "$sha" ]]; then
+              # Same name, same content: nothing to send
+              printf '  %-40s duplicate of xena:inbound/%s, not resent; ' "$f" "$f"
+              src "lz-archive.sh sent $f $sha"
+              record "$f" "$sha" "$bytes" 0 duplicate
+              continue
+            elif [[ -n $existing ]]; then
+              # Same name, different content: never overwrite; set aside for review
+              printf '  %-40s CONFLICT with xena:inbound/%s, not sent; ' "$f" "$f"
+              src "lz-archive.sh conflicts $f $sha 'xena:inbound/$f already holds different content (existing sha256 $existing, incoming $sha)'"
+              record "$f" "$sha" "$bytes" 0 conflict
+              continue
+            fi
+
+            src "age -r $recipient outbound/$f" \
+              | dst "cat > encrypted/.$f.age.part && mv encrypted/.$f.age.part encrypted/$f.age"
+
+            read -r header enc_bytes < <(dst "head -n1 encrypted/$f.age; stat -c %s encrypted/$f.age" | paste -sd' ')
+            [[ $header == "age-encryption.org/v1" ]] || { echo "$f: not an age file ($header)" >&2; exit 1; }
+
+            printf '  %-40s %7s B plaintext -> %7s B ciphertext  sha256:%.12s\n' "$f" "$bytes" "$enc_bytes" "$sha"
+            record "$f" "$sha" "$bytes" "$enc_bytes" sent
+          done
+          jq -sc . /tmp/sent.jsonl > /tmp/sent.json
 
     # --- Step 2b: decrypt in xena, verify, then archive on hercules ----------
     - name: decrypt-and-verify
       inputs:
         parameters:
-          - name: file
-          - name: sha256
-          - name: bytes
-          - name: encrypted-bytes
+          - name: sent
       outputs:
         parameters:
           - {name: result, valueFrom: {path: /tmp/result.json}}
       retryStrategy: *retry
-      activeDeadlineSeconds: 300
+      activeDeadlineSeconds: 600
       script:
-        image: dc-transfer/tools:1.0
+        image: dc-transfer/tools:1.1
         imagePullPolicy: IfNotPresent
         command: [bash]
         env:
-          - {name: FILE, value: "{{inputs.parameters.file}}"}
-          - {name: SHA, value: "{{inputs.parameters.sha256}}"}
-          - {name: BYTES, value: "{{inputs.parameters.bytes}}"}
-          - {name: ENC_BYTES, value: "{{inputs.parameters.encrypted-bytes}}"}
+          - {name: SENT, value: "{{inputs.parameters.sent}}"}
           - {name: SRC_HOST, value: "{{workflow.parameters.source-host}}"}
           - {name: SRC_PORT, value: "{{workflow.parameters.source-port}}"}
           - {name: DST_HOST, value: "{{workflow.parameters.destination-host}}"}
@@ -229,31 +264,55 @@ spec:
         resources: *small
         source: |
           set -euo pipefail
-          opts=(-i /credentials/id_ed25519 -o BatchMode=yes -o ConnectTimeout=10 -o UserKnownHostsFile=/credentials/known_hosts)
+          opts=(-i /credentials/id_ed25519 -o BatchMode=yes -o ConnectTimeout=10
+                -o UserKnownHostsFile=/credentials/known_hosts
+                -o ControlMaster=auto -o ControlPath=/tmp/ssh-%h-%p -o ControlPersist=120)
           src() { ssh "${opts[@]}" -p "$SRC_PORT" "lz@$SRC_HOST" "$@"; }
           dst() { ssh "${opts[@]}" "lz@$DST_HOST" "$@"; }
           work=$(mktemp -d)
+          echo "Decrypting $(jq '[.[] | select(.status == "sent")] | length' <<< "$SENT") file(s) with xena's private key, verifying, then archiving on hercules"
+          jq -r '.[] | select(.status != "sent") | "  \(.file)  \(.status), skipped"' <<< "$SENT"
 
-          echo "1/4 Decrypting xena:encrypted/$FILE.age with xena's private key"
-          dst "cat encrypted/$FILE.age" | age -d -i /age/identity > "$work/$FILE"
+          # Read the list up front: ssh inside the loop would otherwise eat a
+          # `while read` loop's stdin and silently end it after one file
+          mapfile -t rows < <(jq -r '.[] | select(.status == "sent") | "\(.file) \(.sha256)"' <<< "$SENT")
+          declare -A final=()
+          for row in "${rows[@]}"; do
+            read -r f sha <<< "$row"
+            [[ $f =~ ^[A-Za-z0-9._-]+\.txt$ ]] || { echo "Refusing unsafe name: $f" >&2; exit 1; }
 
-          echo "2/4 Verifying against the original's SHA-256"
-          got=$(sha256sum "$work/$FILE" | cut -d' ' -f1)
-          if [[ $got != "$SHA" ]]; then
-            echo "Checksum mismatch: hercules $SHA, decrypted $got" >&2
-            exit 1
-          fi
-          echo "    match: $got"
+            dst "cat encrypted/$f.age" | age -d -i /age/identity > "$work/$f"
+            got=$(sha256sum "$work/$f" | cut -d' ' -f1)
+            if [[ $got != "$sha" ]]; then
+              echo "$f: checksum mismatch: hercules $sha, decrypted $got" >&2
+              exit 1
+            fi
 
-          echo "3/4 Writing xena:inbound/$FILE (temp name, then rename)"
-          dst "cat > inbound/.$FILE.part && mv inbound/.$FILE.part inbound/$FILE" < "$work/$FILE"
-          [[ $(dst "sha256sum inbound/$FILE" | cut -d' ' -f1) == "$SHA" ]] || { echo "Destination copy differs" >&2; exit 1; }
+            # Check again right before writing: never overwrite different content
+            existing=$(dst "if [ -f inbound/$f ]; then sha256sum inbound/$f | cut -d' ' -f1; fi")
+            if [[ -n $existing && $existing != "$sha" ]]; then
+              printf '  %s  CONFLICT: xena:inbound/%s changed since this run checked it; ' "$f" "$f"
+              src "lz-archive.sh conflicts $f $sha 'xena:inbound/$f already holds different content (existing sha256 $existing, incoming $sha)'"
+              final[$f]=conflict
+              continue
+            fi
+            if [[ -z $existing ]]; then  # (on a retry it may already be there)
+              dst "cat > inbound/.$f.part && mv inbound/.$f.part inbound/$f" < "$work/$f"
+              [[ $(dst "sha256sum inbound/$f" | cut -d' ' -f1) == "$sha" ]] || { echo "$f: destination copy differs" >&2; exit 1; }
+            fi
 
-          echo "4/4 Archiving the original on hercules: outbound/ -> sent/"
-          src "if [ -f outbound/$FILE ]; then mv outbound/$FILE sent/$FILE; fi"
+            # Only now is it safe to retire the original, and only if it's still
+            # the version we sent (lz-archive.sh checks the SHA-256)
+            printf '  %s  verified (sha256:%.12s); ' "$f" "$sha"
+            src "lz-archive.sh sent $f $sha"
+            final[$f]=delivered
+            rm -f "$work/$f"
+          done
 
-          printf '{"file":"%s","bytes":%s,"encrypted_bytes":%s,"sha256":"%s"}\n' \
-            "$FILE" "$BYTES" "$ENC_BYTES" "$SHA" | tee /tmp/result.json
+          # Same list back, with "sent" replaced by the final status
+          statuses=$(for f in "${!final[@]}"; do printf '%s\t%s\n' "$f" "${final[$f]}"; done \
+                     | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add // {}')
+          jq -c --argjson st "$statuses" 'map(.status = ($st[.file] // .status))' <<< "$SENT" > /tmp/result.json
 
     # --- Step 3: roll up the fan-out ----------------------------------------
     - name: summarize
@@ -266,12 +325,19 @@ spec:
         resources: *small
         source: |
           import json
-          rows = [json.loads(r["result"]) for r in json.loads(r'''{{inputs.parameters.results}}''')]
-          plain = sum(r["bytes"] for r in rows)
-          enc = sum(r["encrypted_bytes"] for r in rows)
-          print(f"Moved {len(rows)} file(s) hercules -> xena: {plain:,} bytes plaintext, {enc:,} bytes over the wire (encrypted)\n")
+          chunks = [json.loads(r["result"]) for r in json.loads(r'''{{inputs.parameters.results}}''')]
+          rows = [row for chunk in chunks for row in chunk]
+          by = {s: [r for r in rows if r["status"] == s] for s in ("delivered", "duplicate", "conflict")}
+          plain = sum(r["bytes"] for r in by["delivered"])
+          enc = sum(r["encrypted_bytes"] for r in by["delivered"])
+          print(f"{len(rows)} file(s) in {len(chunks)} chunk(s): {len(by['delivered'])} delivered, "
+                f"{len(by['duplicate'])} duplicate(s) skipped, {len(by['conflict'])} conflict(s) set aside")
+          print(f"Delivered {plain:,} bytes plaintext as {enc:,} bytes over the wire (encrypted)\n")
           for r in sorted(rows, key=lambda r: r["file"]):
-              print(f"  {r['file']:<44} {r['bytes']:>8,} B  sha256:{r['sha256'][:12]}")
+              print(f"  {r['file']:<44} {r['bytes']:>8,} B  sha256:{r['sha256'][:12]}  {r['status']}")
+          if by["conflict"]:
+              print("\nConflicts are in hercules:/data/conflicts/ with a .reason file each; "
+                    "xena:inbound/ was not changed.")
 
     - name: log
       inputs:

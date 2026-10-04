@@ -15,5 +15,6 @@ show() {  # show CONTEXT LABEL DIR
 
 show "$SOURCE_CONTEXT" hercules outbound
 show "$SOURCE_CONTEXT" hercules sent
+show "$SOURCE_CONTEXT" hercules conflicts
 show "$DEST_CONTEXT" xena encrypted
 show "$DEST_CONTEXT" xena inbound

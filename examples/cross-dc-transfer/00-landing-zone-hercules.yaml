@@ -41,11 +41,11 @@ spec:
     spec:
       containers:
         - name: sshd
-          image: dc-transfer/tools:1.0
+          image: dc-transfer/tools:1.1
           imagePullPolicy: IfNotPresent
           command: [lz-sshd.sh]
           env:
-            - {name: LZ_DIRS, value: "outbound sent"}
+            - {name: LZ_DIRS, value: "outbound sent conflicts"}
           ports:
             - containerPort: 22
           readinessProbe:
@@ -57,7 +57,7 @@ spec:
           resources:
             requests: {cpu: 10m, memory: 16Mi}
         - name: watcher
-          image: dc-transfer/tools:1.0
+          image: dc-transfer/tools:1.1
           imagePullPolicy: IfNotPresent
           command: [lz-watch.sh]
           securityContext:
