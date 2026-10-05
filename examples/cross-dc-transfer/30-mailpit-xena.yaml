@@ -1,0 +1,66 @@
+# A test mailbox for the workflow's email notifications (kube context k3d-xena).
+#
+# Mailpit accepts any message on SMTP port 1025 and shows it in a web inbox
+# instead of delivering it. Nothing leaves the cluster.
+#   SMTP (in-cluster): mailpit.mail.svc.cluster.local:1025
+#   Inbox:             https://mail.<tailnet>.ts.net  (Tailscale Ingress below)
+#
+# To send real email instead, point the cross-dc-transfer-smtp Secret at your
+# SMTP server (see README) and you can delete this file's resources.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mail
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mailpit
+  namespace: mail
+  labels: {app: mailpit}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: mailpit}
+  template:
+    metadata:
+      labels: {app: mailpit}
+    spec:
+      containers:
+        - name: mailpit
+          image: axllent/mailpit:v1.31.4
+          env:
+            - {name: MP_MAX_MESSAGES, value: "500"}
+          ports:
+            - {name: smtp, containerPort: 1025}
+            - {name: http, containerPort: 8025}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mailpit
+  namespace: mail
+spec:
+  selector: {app: mailpit}
+  ports:
+    - {name: smtp, port: 1025, targetPort: smtp}
+    - {name: http, port: 8025, targetPort: http}
+---
+# Inbox on the tailnet. Mailpit has no login, so anyone on the tailnet can read it.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mailpit-tailscale
+  namespace: mail
+spec:
+  ingressClassName: tailscale
+  defaultBackend:
+    service:
+      name: mailpit
+      port: {number: 8025}
+  tls:
+    - hosts: [mail]

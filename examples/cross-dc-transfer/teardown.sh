@@ -12,6 +12,7 @@ dst -n argo delete ingress landing-zone-webhook --ignore-not-found
 dst -n argo delete rolebinding,role,serviceaccount cross-dc-transfer-sensor --ignore-not-found
 dst -n argo delete workflow -l app=cross-dc-transfer --ignore-not-found
 dst -n argo delete workflowtemplate cross-dc-transfer --ignore-not-found
-dst -n argo delete secret cross-dc-transfer-credentials xena-age-identity landing-zone-webhook --ignore-not-found
+dst -n argo delete secret cross-dc-transfer-credentials xena-age-identity landing-zone-webhook cross-dc-transfer-smtp --ignore-not-found
+dst delete namespace mail --ignore-not-found
 dst delete namespace landing-zone --ignore-not-found
 kubectl --context "$SOURCE_CONTEXT" delete namespace landing-zone --ignore-not-found

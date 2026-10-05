@@ -60,9 +60,20 @@ apply_secret "$DEST_CONTEXT" -n argo xena-age-identity --from-file=identity="$KE
 apply_secret "$DEST_CONTEXT" -n argo landing-zone-webhook --from-file=token="$KEYS/webhook-token"
 dst apply -f 10-workflow-template.yaml -f 20-events-xena.yaml
 
-# 6. Wait for everything to come up
+# 6. Email notifications: a Mailpit test inbox, and SMTP settings pointing at it.
+#    The Secret is only created if missing, so real SMTP settings you put in it
+#    later survive reruns (see README, "Email notifications").
+dst apply -f 30-mailpit-xena.yaml
+if ! dst -n argo get secret cross-dc-transfer-smtp >/dev/null 2>&1; then
+  dst -n argo create secret generic cross-dc-transfer-smtp \
+    --from-literal=host=mailpit.mail.svc.cluster.local --from-literal=port=1025 \
+    --from-literal=from=argo@xena.internal --from-literal=to=data-ops@xena.internal
+fi
+
+# 7. Wait for everything to come up
 src -n landing-zone rollout status deploy/landing-zone --timeout=180s
 dst -n landing-zone rollout status deploy/landing-zone --timeout=180s
+dst -n mail rollout status deploy/mailpit --timeout=180s
 for kind in eventsource sensor; do
   until dst -n argo get pods -l "$kind-name" -o name 2>/dev/null | grep -q .; do sleep 2; done
 done
@@ -73,3 +84,4 @@ echo
 echo "Done. Drop files on hercules to trigger a transfer:"
 echo "  ./drop-files.sh        # 50 files"
 echo "  ./peek.sh              # see both landing zones"
+echo "Failed runs and conflicts are emailed to the Mailpit inbox: https://mail.tail18466c.ts.net"

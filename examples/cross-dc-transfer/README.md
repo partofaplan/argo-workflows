@@ -70,6 +70,36 @@ version stays in `outbound/` for the next run instead of being filed as sent.
 It also never overwrites a different file already in `sent/` or `conflicts/`;
 it adds a timestamp to the name instead.
 
+### Email notifications
+
+An exit handler (`notify`) runs after every run, whether it passed or failed.
+With the default `notify-on=attention`, it sends email only when someone
+should look:
+
+- **Failed run**: the subject is `FAILED: <run>`. The email lists each failed
+  attempt and notes that unfinished files stay in `outbound/` for the next run.
+- **Conflicts set aside**: the subject is `N conflict(s) need review: <run>`.
+  The email lists each file and points to `hercules:/data/conflicts/`.
+
+Clean runs send nothing. Set `notify-on` to `always` or `never` to change
+that. Every email links to the run in the Argo UI.
+
+By default, mail goes to **Mailpit** (`30-mailpit-xena.yaml`), a test inbox in
+xena that catches every message instead of delivering it. Read it at
+`https://mail.<tailnet>.ts.net`. It has no login, so anyone on your tailnet
+can read it.
+
+To send real email, replace the `cross-dc-transfer-smtp` Secret.
+`setup.sh` only creates it when it's missing, so your settings survive reruns:
+
+```sh
+kubectl --context k3d-xena -n argo create secret generic cross-dc-transfer-smtp \
+  --from-literal=host=smtp.office365.com --from-literal=port=587 --from-literal=starttls=true \
+  --from-literal=username=alerts@example.com --from-literal=password='...' \
+  --from-literal=from=alerts@example.com --from-literal=to='ops@example.com,you@example.com' \
+  --dry-run=client -o yaml | kubectl --context k3d-xena apply -f -
+```
+
 ## How the two "data centers" reach each other
 
 The clusters are on separate Docker networks. Each one reaches the other
@@ -93,6 +123,7 @@ accepts the demo key. The webhook rejects calls without the token (401).
 | `01-landing-zone-xena.yaml` | Destination landing zone: sshd, on a PVC |
 | `10-workflow-template.yaml` | The transfer pipeline |
 | `20-events-xena.yaml` | EventBus, webhook EventSource, Traefik route, Sensor and its RBAC |
+| `30-mailpit-xena.yaml` | Mailpit test inbox for the email notifications, with a Tailscale Ingress |
 | `setup.sh` | Builds the image, generates keys into `.keys/` (gitignored), creates the Secrets, applies everything to both clusters |
 | `drop-files.sh` | Drops N gibberish `.txt` files (default 50) on hercules, which triggers a run |
 | `drop-repeats.sh` | Re-drops N exact copies and N same-name-new-content files (default 2 each), using names xena already has |
@@ -137,3 +168,16 @@ kubectl --context k3d-xena -n landing-zone exec deploy/landing-zone -- \
   reports 5 delivered, 2 duplicates skipped and 2 conflicts set aside. Then
   `./peek.sh` shows the conflicts on hercules. Each `.reason` file shows the
   existing and incoming checksums, and nothing in `xena:inbound/` changed.
+- **Alerts**: after `./drop-repeats.sh`, open the Mailpit inbox for the
+  conflict email. To show a failure email, start a run pointed at a port with
+  nothing behind it. It fails after about 2 minutes of retries:
+  ```sh
+  kubectl --context k3d-xena -n argo create -f - <<'YAML'
+  apiVersion: argoproj.io/v1alpha1
+  kind: Workflow
+  metadata: {generateName: cross-dc-transfer-failtest-, labels: {app: cross-dc-transfer}}
+  spec:
+    workflowTemplateRef: {name: cross-dc-transfer}
+    arguments: {parameters: [{name: source-port, value: "2399"}]}
+  YAML
+  ```

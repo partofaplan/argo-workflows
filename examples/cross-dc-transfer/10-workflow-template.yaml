@@ -28,6 +28,10 @@
 #
 # Started by the Sensor in 20-events-xena.yaml when files land on hercules.
 # The mutex makes overlapping triggers queue up instead of fighting over files.
+#
+# onExit: notify      always runs, even if the run failed. Emails when the run
+#                     failed or set conflicts aside (notify-on=attention), using
+#                     the SMTP settings in the cross-dc-transfer-smtp Secret.
 apiVersion: argoproj.io/v1alpha1
 kind: WorkflowTemplate
 metadata:
@@ -36,6 +40,7 @@ metadata:
 spec:
   serviceAccountName: argo-workflow
   entrypoint: move-files
+  onExit: notify
   activeDeadlineSeconds: 1800
   ttlStrategy:
     secondsAfterSuccess: 86400
@@ -59,6 +64,13 @@ spec:
       - name: chunk-size
         description: Files handled by each pair of encrypt/decrypt pods
         value: "10"
+      - name: notify-on
+        description: "When to email: attention (failed run or conflicts), always, or never"
+        value: attention
+        enum: [attention, always, never]
+      - name: argo-ui-url
+        description: Base URL of the Argo UI, for the link in the email
+        value: https://argo.tail18466c.ts.net
 
   volumes:
     # SSH client key, known_hosts for both landing zones, xena's age public key
@@ -158,8 +170,11 @@ spec:
                     -o UserKnownHostsFile=/credentials/known_hosts -p "$SRC_PORT" "lz@$SRC_HOST" "$@"; }
 
           echo "Listing hercules:/data/outbound"
+          # List first, on its own line, so an unreachable hercules fails the step
+          # (and is retried, then reported) instead of looking like an empty folder
+          listing=$(src 'ls -1 outbound')
           # Only plain names, so file names are safe to use in remote commands
-          src 'ls -1 outbound' | grep -E '^[A-Za-z0-9._-]+\.txt$' | sort | head -n "$MAX_FILES" > /tmp/names || true
+          { grep -E '^[A-Za-z0-9._-]+\.txt$' <<< "$listing" || true; } | sort | head -n "$MAX_FILES" > /tmp/names
           jq -R . /tmp/names | jq -sc --argjson n "$CHUNK_SIZE" '[range(0; length; $n) as $i | .[$i:$i+$n]]' > /tmp/chunks.json
           wc -l < /tmp/names | tr -d ' ' > /tmp/count
           echo "$(cat /tmp/count) file(s) to move this run, in $(jq length /tmp/chunks.json) chunk(s) of up to $CHUNK_SIZE"
@@ -319,6 +334,12 @@ spec:
       inputs:
         parameters:
           - name: results
+      outputs:
+        parameters:
+          # Exported workflow-wide so the onExit notify step can read it
+          - name: report
+            globalName: report
+            valueFrom: {path: /tmp/report.json}
       script:
         image: python:3.12-alpine
         command: [python]
@@ -338,6 +359,97 @@ spec:
           if by["conflict"]:
               print("\nConflicts are in hercules:/data/conflicts/ with a .reason file each; "
                     "xena:inbound/ was not changed.")
+
+          with open("/tmp/report.json", "w") as f:
+              json.dump({"chunks": len(chunks), "files": rows}, f)
+
+    # --- Exit handler: email when someone should look ------------------------
+    # Runs after every run, passed or failed. The report is missing when the run
+    # failed before summarize, so it falls back to "none".
+    - name: notify
+      retryStrategy: *retry
+      script:
+        image: python:3.12-alpine
+        command: [python]
+        resources: *small
+        env:  # env vars, so JSON in these values can't break the script
+          - {name: STATUS, value: "{{workflow.status}}"}
+          - {name: FAILURES, value: "{{workflow.failures}}"}
+          - {name: REPORT, value: "{{=sprig.default('none', workflow.outputs?.parameters?.report)}}"}
+          - {name: NOTIFY_ON, value: "{{workflow.parameters.notify-on}}"}
+          - {name: RUN_NAME, value: "{{workflow.name}}"}
+          - {name: RUN_URL, value: "{{workflow.parameters.argo-ui-url}}/workflows/{{workflow.namespace}}/{{workflow.name}}"}
+          - {name: DURATION, value: "{{workflow.duration}}"}
+          # SMTP settings; host/port/from/to required, username/password/starttls optional
+          - {name: SMTP_HOST, valueFrom: {secretKeyRef: {name: cross-dc-transfer-smtp, key: host}}}
+          - {name: SMTP_PORT, valueFrom: {secretKeyRef: {name: cross-dc-transfer-smtp, key: port}}}
+          - {name: MAIL_FROM, valueFrom: {secretKeyRef: {name: cross-dc-transfer-smtp, key: from}}}
+          - {name: MAIL_TO, valueFrom: {secretKeyRef: {name: cross-dc-transfer-smtp, key: to}}}
+          - {name: SMTP_USERNAME, valueFrom: {secretKeyRef: {name: cross-dc-transfer-smtp, key: username, optional: true}}}
+          - {name: SMTP_PASSWORD, valueFrom: {secretKeyRef: {name: cross-dc-transfer-smtp, key: password, optional: true}}}
+          - {name: SMTP_STARTTLS, valueFrom: {secretKeyRef: {name: cross-dc-transfer-smtp, key: starttls, optional: true}}}
+        source: |
+          import json, os, smtplib
+          from email.message import EmailMessage
+
+          env = os.environ.get
+          status = env("STATUS")
+          report = json.loads(env("REPORT")) if env("REPORT", "none") != "none" else None
+          failures = json.loads(env("FAILURES") or "null")
+          if isinstance(failures, str):
+              failures = json.loads(failures)
+          failures = [f for f in failures or [] if f.get("message")]  # skip group nodes
+
+          files = report["files"] if report else []
+          count = lambda s: sum(1 for r in files if r["status"] == s)
+          conflicts = [r for r in files if r["status"] == "conflict"]
+
+          needs_attention = status != "Succeeded" or bool(conflicts)
+          mode = env("NOTIFY_ON")
+          if mode == "never" or (mode == "attention" and not needs_attention):
+              print(f"Run {status}, {len(conflicts)} conflict(s): no email (notify-on={mode})")
+              raise SystemExit(0)
+
+          if status != "Succeeded":
+              subject = f"[cross-dc-transfer] FAILED: {env('RUN_NAME')}"
+          elif conflicts:
+              subject = f"[cross-dc-transfer] {len(conflicts)} conflict(s) need review: {env('RUN_NAME')}"
+          else:
+              subject = f"[cross-dc-transfer] Succeeded: {env('RUN_NAME')}"
+
+          lines = [f"Run:      {env('RUN_NAME')}",
+                   f"Status:   {status} after {float(env('DURATION') or 0):.0f}s",
+                   f"Details:  {env('RUN_URL')}", ""]
+          if report:
+              lines.append(f"{len(files)} file(s): {count('delivered')} delivered, "
+                           f"{count('duplicate')} duplicate(s) skipped, {len(conflicts)} conflict(s) set aside")
+          else:
+              lines.append("The run failed before it could summarize which files moved.")
+          if conflicts:
+              lines += ["", "Conflicts (same name as a file xena already has, different content).",
+                        "Not sent; xena:inbound/ was not changed. Originals and a .reason file for each",
+                        "are in hercules:/data/conflicts/:"]
+              lines += [f"  {r['file']}  (incoming sha256 {r['sha256'][:12]})" for r in conflicts]
+          if failures:
+              lines += ["", "Failures:"]
+              lines += [f"  {f['finishedAt']}  {f['displayName']}: {f['message']}"
+                        for f in sorted(failures, key=lambda f: f.get("finishedAt") or "")]
+          if status != "Succeeded":
+              lines += ["", "Files that didn't finish are still in hercules:/data/outbound/ and will go",
+                        "with the next run."]
+
+          msg = EmailMessage()
+          msg["Subject"], msg["From"], msg["To"] = subject, env("MAIL_FROM"), env("MAIL_TO")
+          msg.set_content("\n".join(lines) + "\n")
+
+          with smtplib.SMTP(env("SMTP_HOST"), int(env("SMTP_PORT")), timeout=30) as smtp:
+              if env("SMTP_STARTTLS", "").lower() == "true":
+                  smtp.starttls()
+              if env("SMTP_USERNAME"):
+                  smtp.login(env("SMTP_USERNAME"), env("SMTP_PASSWORD", ""))
+              smtp.send_message(msg, to_addrs=[a.strip() for a in env("MAIL_TO").split(",")])
+          print(f"Emailed {env('MAIL_TO')}: {subject}")
+          print("\n".join(lines))
 
     - name: log
       inputs:
